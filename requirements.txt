@@ -1,0 +1,4 @@
+textual==7.5.0
+pillow==12.1.0
+numpy==2.2.6
+yt-dlp==2026.1.31

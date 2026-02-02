@@ -1,0 +1,167 @@
+Here you go: a **copy-paste context brief** you can hand to an LLM agent. It includes the *why*, the *what*, requirements, UX, file structure, and pipeline stages.
+
+NOTE: The optional external OpenCV preview window has been removed from the project. Any references below to a GUI preview window or `ascii_preview_window.py` are outdated.
+
+---
+
+## Context Brief: ASCII/Braille Music Video Generator (Python + TUI + Preview Window)
+
+### Goal
+
+Build a Python app that turns a YouTube (or local) video into an **ASCII-style “music video”** by:
+
+1. extracting frames at a user-defined interval (default **5 seconds**)
+2. converting each frame into **high-detail text art** (ASCII ramp or **Braille ultra-dense**)
+3. rendering each text frame into an image
+4. assembling images back into an MP4 and **muxing original audio**
+5. optionally opening a **separate GUI preview window** to visualize the output live, because terminal rendering on Windows can be inconsistent (fonts/Unicode spacing).
+
+### Why we need a preview window
+
+Windows Terminal *may* render Braille/Unicode, but support depends on fonts and rendering quirks. We want a reliable visualization method, so the app includes an **OpenCV preview window** that plays the rendered frame images in real-time while the pipeline runs.
+
+### Key Features
+
+* **Textual TUI** UI (responsive during long tasks)
+* Accept input source:
+
+  * YouTube URL (download via `yt-dlp`)
+  * OR local file path
+* Controls:
+
+  * Frame interval seconds (default 5.0)
+  * Output width in characters (e.g., 180–320+)
+  * Mode: `ASCII` or `Braille`
+  * Output file name (`ascii_final.mp4` by default)
+* Pipeline:
+
+  * Download (if URL)
+  * Extract frames (FFmpeg)
+  * Convert frames → text (ASCII ramp or Braille dots)
+  * Render text → PNG frames (Pillow)
+  * Encode PNG frames → MP4 (FFmpeg)
+  * Mux original audio (FFmpeg)
+* Progress + logs in TUI
+* **Text preview** inside TUI (latest frame as text)
+* **Adjustable Preview Window option** (OpenCV):
+
+  * Preview mode: `Off` | `Manual` | `Auto-open on Start`
+  * Preview FPS: `Auto (1/interval)` or `Custom`
+  * Preview scale: e.g. `0.75`, `1.0`, `1.5`
+  * Auto-close preview on completion (toggle)
+  * Buttons: `Open Preview` and `Close Preview`
+* Cancel support: Cancel worker tasks and stop pipeline
+
+### Detail Modes
+
+* **ASCII mode**:
+
+  * Use a long character ramp for tonal detail, map grayscale pixels to characters.
+  * Needs aspect correction because characters aren’t square.
+* **Braille mode** (preferred for “really high detailed”):
+
+  * Each Braille char is a 2×4 dot matrix (8 bits), so much more resolution per character.
+  * Convert grayscale → thresholded dots → Braille codepoints (U+2800 base).
+
+### Technology / Libraries
+
+* TUI: `textual`
+* Download: `yt-dlp`
+* Frames and mux: `ffmpeg`
+* Image processing: `Pillow`, `numpy`
+* Preview window: `opencv-python`
+* Rendering text frames: Pillow draws monospaced font to PNG images
+
+### Expected Environment
+
+* Windows-friendly, but should also run on macOS/Linux.
+* Needs `ffmpeg` on PATH.
+* Needs a monospaced font file accessible (auto-detect common fonts: Consolas/Menlo/DejaVu Mono). If missing, user provides one.
+
+### User Experience Requirements
+
+* UI should remain responsive; pipeline runs in background workers.
+* Logs should show stage transitions and progress.
+* Preview window should run as a separate process to avoid TUI rendering issues.
+* Preview window should “follow along” as frames appear in the render directory.
+* Preview options should be adjustable in the TUI:
+
+  * Off / Manual / Auto-open
+  * FPS auto or custom
+  * Scale
+  * Auto-close at end
+
+### File Structure (minimal)
+
+* `ascii_mv_tui.py`
+
+  * Textual app
+  * Pipeline logic
+  * Preview settings and process spawning
+* `ascii_preview_window.py`
+
+  * Simple OpenCV loop that watches a folder for `frame_000001.png` etc and displays frames as they arrive.
+
+### Pipeline Stages (and what they do)
+
+1. **Download stage** (only for URL)
+
+   * Use yt-dlp to download best video+audio and merge into mp4.
+2. **Extract stage**
+
+   * `ffmpeg -vf fps=1/interval` → `frames/frame_%06d.png`
+3. **Render stage**
+
+   * For each extracted frame:
+
+     * convert to ASCII or Braille text
+     * render that text into a PNG in `render/frame_%06d.png`
+4. **Encode stage**
+
+   * `ffmpeg -framerate 1/interval -i render/frame_%06d.png` → silent mp4
+5. **Mux stage**
+
+   * mux original audio into final mp4, `-shortest`
+
+### Preview Window Behavior
+
+* Reads from `ascii_work/render/`
+* Shows the latest existing frame and advances when the next frame file exists.
+* Controls:
+
+  * `q` or `ESC` closes
+  * `space` pause/unpause
+  * `r` restart
+  * `[` / `]` step when paused
+* FPS configuration:
+
+  * Auto uses `1/interval`
+  * Custom uses user-provided value
+* Scale:
+
+  * Multiply image size in OpenCV before showing
+
+### Quality knobs (important for “music video vibe”)
+
+* **Width(chars)**:
+
+  * higher = more detail (CPU heavier)
+* **Interval(s)**:
+
+  * 5.0 = storyboard / slideshow
+  * 0.2 (5 fps) = motion
+  * 0.1 (10 fps) = smoother motion
+* Prefer Braille for best detail.
+
+### Deliverable
+
+A working prototype that:
+
+* runs locally
+* provides a TUI interface with adjustable preview options
+* generates an MP4 with the original audio
+* can show live output in a GUI preview window even if terminal rendering is unreliable
+
+---
+
+If you want, I can also convert this into a more “agent-ready” **spec format** (like: **Goal / Inputs / Outputs / Constraints / Tasks / Acceptance tests / Edge cases**) so your agent can execute it without missing anything.

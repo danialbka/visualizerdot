@@ -33,6 +33,8 @@ sudo apt-get install -y nodejs npm
 python3 ascii_mv_tui.py
 ```
 
+Braille tuning: adjust **Braille Thresh** (0-255). Lower = darker, higher = lighter.
+
 ## Making It “Continuous”
 
 Set **FPS** to something like `5` (lighter) or `10` (smoother). The old default of 5 seconds per frame was a slideshow.

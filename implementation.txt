@@ -1,0 +1,811 @@
+Absolutely. Here’s the **full plan + a complete draft** (copy-paste ready).
+
+NOTE: The optional external OpenCV preview window has been removed from the project. Any references below to a GUI preview window or `ascii_preview_window.py` are outdated.
+
+You’ll end up with:
+
+* a **Textual TUI** for the pipeline (download → frames → ASCII/Braille → MP4)
+* an optional **GUI preview window** (OpenCV) that live-plays frames as they’re being rendered
+* preview settings you can tweak: **On/Off**, **Auto-open**, **FPS (auto or custom)**, **Scale**, **Auto-close**
+
+---
+
+## Project plan (full)
+
+### Goals
+
+1. Paste a **YouTube URL** (or local file path)
+2. Extract frames every **N seconds**
+3. Convert frames into **high-detail text art**
+
+   * Mode: **ASCII** (ramp) or **Braille** (ultra-dense)
+   * Adjustable width in characters
+4. Render each text frame into a PNG (clean, consistent)
+5. Assemble PNGs back into MP4 and **mux original audio**
+6. Optional: open a **live preview window** while rendering
+
+### UX flow in the TUI
+
+* Input fields:
+
+  * Source (URL or file path)
+  * Interval (seconds)
+  * Width (characters)
+  * Mode (ASCII / Braille)
+  * Output filename
+* Preview controls:
+
+  * Preview: Off / Manual / Auto-open
+  * Preview FPS: Auto (1/interval) or Custom
+  * Preview scale (e.g. 1.0, 1.5)
+  * Auto-close preview at end (toggle)
+  * Buttons: Open Preview, Close Preview
+* Start / Cancel
+* Logs + progress bar + text preview inside the TUI
+
+### Reality check (important so the vibe matches)
+
+* If **interval = 5.0s**, you get a slideshow (one frame every 5 seconds). Totally valid for “ASCII storyboard”.
+* If you want “music video motion”:
+
+  * **0.2s** (5 fps) starts feeling alive
+  * **0.1s** (10 fps) feels legit animated
+    (CPU goes 🥵, but the output looks 🔥)
+
+### File layout (minimal)
+
+Put both files in the same folder:
+
+* `ascii_mv_tui.py` (main app)
+* `ascii_preview_window.py` (preview player)
+
+---
+
+## Install
+
+### System
+
+You need **ffmpeg** on PATH.
+
+### Python deps
+
+```bash
+pip install textual pillow numpy yt-dlp opencv-python
+```
+
+---
+
+## File 1: `ascii_preview_window.py` (the live GUI preview)
+
+```python
+import argparse
+import time
+from pathlib import Path
+
+import cv2
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("render_dir", help="Directory with rendered PNG frames (frame_000001.png etc.)")
+    ap.add_argument("--fps", type=float, default=5.0, help="Playback FPS for the preview window")
+    ap.add_argument("--scale", type=float, default=1.0, help="Scale window (e.g. 0.75, 1.0, 1.5)")
+    ap.add_argument("--title", type=str, default="ASCII Preview", help="Window title")
+    args = ap.parse_args()
+
+    render_dir = Path(args.render_dir)
+    if not render_dir.exists():
+        raise SystemExit(f"Render dir not found: {render_dir}")
+
+    fps = max(0.1, args.fps)
+    delay_ms = max(1, int(1000 / fps))
+
+    cv2.namedWindow(args.title, cv2.WINDOW_NORMAL)
+
+    idx = 1
+    paused = False
+    last_frame = None
+
+    # Controls:
+    # q / ESC: quit
+    # space: pause
+    # r: restart
+    # ]: step forward (paused)
+    # [: step back (paused)
+    while True:
+        frame_path = render_dir / f"frame_{idx:06d}.png"
+
+        if not paused and frame_path.exists():
+            img = cv2.imread(str(frame_path), cv2.IMREAD_COLOR)
+            if img is not None:
+                if args.scale != 1.0:
+                    h, w = img.shape[:2]
+                    img = cv2.resize(
+                        img,
+                        (max(1, int(w * args.scale)), max(1, int(h * args.scale))),
+                        interpolation=cv2.INTER_AREA,
+                    )
+                last_frame = img
+                idx += 1
+
+        if last_frame is not None:
+            cv2.imshow(args.title, last_frame)
+
+        key = cv2.waitKey(delay_ms) & 0xFF
+        if key == ord("q") or key == 27:
+            break
+        if key == ord(" "):
+            paused = not paused
+        if key == ord("r"):
+            idx = 1
+        if key == ord("]") and paused:
+            idx += 1
+        if key == ord("[") and paused and idx > 2:
+            idx -= 2
+
+        # If we’re waiting for the next frame to be rendered, chill a bit
+        if not paused and not frame_path.exists():
+            time.sleep(0.05)
+
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+## File 2: `ascii_mv_tui.py` (Textual TUI with adjustable preview option)
+
+```python
+import math
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from typing import Optional, Literal
+
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+from yt_dlp import YoutubeDL
+
+from textual.app import App, ComposeResult
+from textual import work
+from textual.message import Message
+from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.widgets import (
+    Button,
+    Footer,
+    Header,
+    Input,
+    Label,
+    LoadingIndicator,
+    ProgressBar,
+    RichLog,
+    Select,
+    Static,
+    Switch,
+)
+
+ASCII_RAMP = " .'`^\",:;Il!i><~+_-?][}{1)(|\\/*tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&8%B@$"
+Mode = Literal["ascii", "braille"]
+
+
+# -------------------------
+# Helpers
+# -------------------------
+
+def ensure_ffmpeg():
+    if shutil.which("ffmpeg") is None:
+        raise RuntimeError("ffmpeg not found on PATH. Install ffmpeg first.")
+
+
+def safe_mkdir(p: Path):
+    p.mkdir(parents=True, exist_ok=True)
+
+
+def find_mono_font() -> str:
+    candidates = [
+        "C:/Windows/Fonts/consola.ttf",
+        "C:/Windows/Fonts/lucon.ttf",
+        "/System/Library/Fonts/Menlo.ttc",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    raise FileNotFoundError("Could not auto-find a monospaced font. Set font path manually.")
+
+
+def human_bytes(n: float) -> str:
+    if not n:
+        return "0B"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    k = 1024.0
+    i = min(int(math.log(n, k)), len(units) - 1)
+    return f"{n / (k ** i):.2f}{units[i]}"
+
+
+# -------------------------
+# Text conversion
+# -------------------------
+
+def img_to_ascii(img_path: Path, width_chars: int) -> str:
+    img = Image.open(img_path).convert("L")
+    w, h = img.size
+
+    aspect_fix = 0.55
+    height_chars = max(1, int((h / w) * width_chars * aspect_fix))
+
+    small = img.resize((width_chars, height_chars), Image.Resampling.LANCZOS)
+    arr = np.asarray(small, dtype=np.uint8)
+
+    idx = (arr.astype(np.float32) / 255.0) * (len(ASCII_RAMP) - 1)
+    idx = idx.astype(np.int32)
+
+    # Dark -> dense
+    idx = (len(ASCII_RAMP) - 1) - idx
+
+    lines = ["".join(ASCII_RAMP[i] for i in row) for row in idx]
+    return "\n".join(lines)
+
+
+def img_to_braille(img_path: Path, width_chars: int, threshold: int = 140) -> str:
+    img = Image.open(img_path).convert("L")
+    w, h = img.size
+
+    height_chars = max(1, int((h / w) * width_chars / 2))
+
+    target_w = width_chars * 2
+    target_h = height_chars * 4
+    small = img.resize((target_w, target_h), Image.Resampling.LANCZOS)
+    arr = np.asarray(small, dtype=np.uint8)
+
+    on = arr < threshold
+
+    dot_bits = [
+        (0, 0, 0x01),
+        (0, 1, 0x02),
+        (0, 2, 0x04),
+        (1, 0, 0x08),
+        (1, 1, 0x10),
+        (1, 2, 0x20),
+        (0, 3, 0x40),
+        (1, 3, 0x80),
+    ]
+
+    lines = []
+    for cy in range(height_chars):
+        y0 = cy * 4
+        row_chars = []
+        for cx in range(width_chars):
+            x0 = cx * 2
+            bits = 0
+            for dx, dy, b in dot_bits:
+                if on[y0 + dy, x0 + dx]:
+                    bits |= b
+            row_chars.append(chr(0x2800 + bits))
+        lines.append("".join(row_chars))
+    return "\n".join(lines)
+
+
+def render_text_to_png(
+    text: str,
+    out_path: Path,
+    font_path: str,
+    font_size: int,
+    padding: int,
+):
+    font = ImageFont.truetype(font_path, font_size)
+    lines = text.splitlines() or [""]
+
+    bbox = font.getbbox("M")
+    char_w = max(1, bbox[2] - bbox[0])
+    char_h = max(1, bbox[3] - bbox[1])
+
+    img_w = padding * 2 + char_w * max(len(line) for line in lines)
+    img_h = padding * 2 + char_h * len(lines)
+
+    canvas = Image.new("RGB", (img_w, img_h), (0, 0, 0))
+    draw = ImageDraw.Draw(canvas)
+    draw.text((padding, padding), text, font=font, fill=(255, 255, 255))
+    canvas.save(out_path)
+
+
+# -------------------------
+# Video pipeline
+# -------------------------
+
+def ytdlp_download(url: str, out_dir: Path, post):
+    safe_mkdir(out_dir)
+    outtmpl = str(out_dir / "input.%(ext)s")
+
+    def hook(d):
+        if d.get("status") == "downloading":
+            total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+            downloaded = d.get("downloaded_bytes") or 0
+            pct = (downloaded / total * 100.0) if total else None
+            speed = d.get("speed") or 0
+            eta = d.get("eta")
+            post(ProgressUpdate(stage="download", percent=pct))
+            if pct is not None:
+                msg = f"Downloading… {pct:5.1f}% | {human_bytes(speed)}/s"
+                if eta:
+                    msg += f" | ETA {eta}s"
+                post(LogLine(msg))
+        elif d.get("status") == "finished":
+            post(ProgressUpdate(stage="download", percent=100.0))
+            post(LogLine("Download finished, merging streams…"))
+
+    ydl_opts = {
+        "outtmpl": outtmpl,
+        "format": "bv*+ba/b",
+        "merge_output_format": "mp4",
+        "quiet": True,
+        "noprogress": True,
+        "progress_hooks": [hook],
+    }
+
+    with YoutubeDL(ydl_opts) as ydl:
+        ydl.extract_info(url, download=True)
+
+    for p in sorted(out_dir.glob("input.*"), key=lambda x: x.stat().st_mtime, reverse=True):
+        return p
+    raise FileNotFoundError("Download finished but no input.* file found.")
+
+
+def extract_frames(video_path: Path, frames_dir: Path, interval_sec: float, post):
+    safe_mkdir(frames_dir)
+    post(LogLine(f"Extracting frames every {interval_sec}s…"))
+    post(ProgressUpdate(stage="extract", percent=None))
+
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-i", str(video_path),
+        "-vf", f"fps=1/{interval_sec}",
+        str(frames_dir / "frame_%06d.png"),
+    ]
+    subprocess.run(cmd, check=True)
+    post(LogLine("Frame extraction done."))
+    post(ProgressUpdate(stage="extract", percent=100.0))
+
+
+def render_frames(frames_dir: Path, render_dir: Path, width_chars: int, mode: Mode, font_path: str,
+                  font_size: int, padding: int, post):
+    safe_mkdir(render_dir)
+    frame_paths = sorted(frames_dir.glob("frame_*.png"))
+    total = len(frame_paths)
+    if total == 0:
+        raise RuntimeError("No frames extracted. Is ffmpeg installed and the video readable?")
+
+    post(LogLine(f"Rendering {total} frames in {mode.upper()} mode…"))
+    post(ProgressUpdate(stage="render", percent=0.0))
+
+    for i, img_path in enumerate(frame_paths, start=1):
+        if mode == "braille":
+            text = img_to_braille(img_path, width_chars)
+        else:
+            text = img_to_ascii(img_path, width_chars)
+
+        out_png = render_dir / img_path.name
+        render_text_to_png(text, out_png, font_path, font_size, padding)
+
+        if i == 1 or i % 5 == 0 or i == total:
+            post(PreviewFrame(frame=i, total=total, text=text))
+
+        post(ProgressUpdate(stage="render", percent=(i / total) * 100.0))
+
+    post(LogLine("Rendering complete."))
+
+
+def assemble_video(render_dir: Path, interval_sec: float, out_silent: Path, post):
+    post(LogLine("Encoding ASCII frames into MP4…"))
+    post(ProgressUpdate(stage="encode", percent=None))
+
+    fps = 1.0 / interval_sec
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-framerate", f"{fps:.6f}",
+        "-i", str(render_dir / "frame_%06d.png"),
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        "-crf", "18",
+        "-preset", "veryfast",
+        str(out_silent),
+    ]
+    subprocess.run(cmd, check=True)
+    post(ProgressUpdate(stage="encode", percent=100.0))
+
+
+def mux_audio(video_silent: Path, original_video: Path, out_final: Path, post):
+    post(LogLine("Muxing original audio…"))
+    post(ProgressUpdate(stage="mux", percent=None))
+
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-i", str(video_silent),
+        "-i", str(original_video),
+        "-map", "0:v:0",
+        "-map", "1:a:0?",
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-shortest",
+        str(out_final),
+    ]
+    subprocess.run(cmd, check=True)
+    post(ProgressUpdate(stage="mux", percent=100.0))
+    post(LogLine(f"✅ Done: {out_final}"))
+
+
+# -------------------------
+# Textual messages
+# -------------------------
+
+class LogLine(Message):
+    def __init__(self, text: str) -> None:
+        self.text = text
+        super().__init__()
+
+
+class ProgressUpdate(Message):
+    def __init__(self, stage: str, percent: Optional[float]) -> None:
+        self.stage = stage
+        self.percent = percent
+        super().__init__()
+
+
+class PreviewFrame(Message):
+    def __init__(self, frame: int, total: int, text: str) -> None:
+        self.frame = frame
+        self.total = total
+        self.text = text
+        super().__init__()
+
+
+# -------------------------
+# Textual App
+# -------------------------
+
+class AsciiMV(App):
+    CSS = """
+    Screen { layout: vertical; }
+    #top { height: auto; padding: 1; }
+    #controls { height: auto; }
+    #controls_row2 { height: auto; margin-top: 1; }
+    #main { height: 1fr; }
+    #left { width: 1fr; border: round $panel; padding: 1; }
+    #right { width: 2fr; border: round $panel; padding: 1; }
+    #preview_box { height: 1fr; }
+    #preview { height: 1fr; }
+    #status_row { height: auto; margin-top: 1; }
+    """
+
+    TITLE = "ASCII Music Video (TUI)"
+    SUB_TITLE = "YouTube → frames → ASCII/Braille → MP4 (with optional preview window)"
+
+    def __init__(self):
+        super().__init__()
+        self.preview_proc: Optional[subprocess.Popen] = None
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+
+        with Vertical(id="top"):
+            yield Label("Source (YouTube URL or local file path):")
+            yield Input(placeholder="https://www.youtube.com/watch?v=… OR C:\\video.mp4", id="source")
+
+            with Horizontal(id="controls"):
+                yield Label("Interval(s):")
+                yield Input(value="5", id="interval", type="number")
+                yield Label("Width(chars):")
+                yield Input(value="200", id="width", type="number")
+                yield Label("Mode:")
+                yield Select(
+                    options=[("ASCII ramp", "ascii"), ("Braille (ultra-dense)", "braille")],
+                    value="braille",
+                    id="mode",
+                )
+                yield Label("Output:")
+                yield Input(value="ascii_final.mp4", id="out")
+                yield Button("Start", id="start", variant="success")
+                yield Button("Cancel", id="cancel", variant="error", disabled=True)
+
+            # Preview options (adjustable)
+            with Horizontal(id="controls_row2"):
+                yield Label("Preview:")
+                yield Select(
+                    options=[("Off", "off"), ("Manual", "manual"), ("Auto-open on Start", "auto")],
+                    value="auto",
+                    id="preview_mode",
+                )
+                yield Label("FPS:")
+                yield Select(
+                    options=[("Auto (1/interval)", "auto"), ("Custom", "custom")],
+                    value="auto",
+                    id="preview_fps_mode",
+                )
+                yield Input(value="", placeholder="e.g. 5", id="preview_fps", type="number")
+                yield Label("Scale:")
+                yield Input(value="1.0", id="preview_scale", type="number")
+                yield Label("Auto-close:")
+                yield Switch(value=False, id="preview_autoclose")
+                yield Button("Open Preview", id="open_preview")
+                yield Button("Close Preview", id="close_preview")
+
+        with Horizontal(id="main"):
+            with Vertical(id="left"):
+                yield Label("Logs")
+                yield RichLog(id="log", highlight=False, markup=False)
+                with Horizontal(id="status_row"):
+                    yield LoadingIndicator(id="spinner")
+                    yield Label("Idle", id="stage")
+                yield ProgressBar(total=100, id="progress")
+
+            with Vertical(id="right"):
+                yield Label("Text preview (latest rendered frame)")
+                with VerticalScroll(id="preview_box"):
+                    yield Static("", id="preview", markup=False)
+
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.query_one("#spinner", LoadingIndicator).display = False
+        # Hide preview fps input unless custom
+        self._update_preview_fps_input()
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id == "preview_fps_mode":
+            self._update_preview_fps_input()
+
+    def _update_preview_fps_input(self):
+        mode = self.query_one("#preview_fps_mode", Select).value
+        fps_input = self.query_one("#preview_fps", Input)
+        fps_input.disabled = (mode != "custom")
+
+    def log(self, text: str) -> None:
+        self.query_one("#log", RichLog).write(text)
+
+    def set_stage(self, stage: str, spinning: bool) -> None:
+        self.query_one("#stage", Label).update(stage)
+        spinner = self.query_one("#spinner", LoadingIndicator)
+        spinner.display = spinning
+
+    def set_progress(self, pct: Optional[float]) -> None:
+        bar = self.query_one("#progress", ProgressBar)
+        if pct is None:
+            bar.update(total=100, progress=0)
+        else:
+            bar.update(total=100, progress=max(0, min(100, int(pct))))
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        bid = event.button.id
+        if bid == "start":
+            self.start_job()
+        elif bid == "cancel":
+            self.cancel_job()
+        elif bid == "open_preview":
+            self.open_preview_window()
+        elif bid == "close_preview":
+            self.close_preview_window()
+
+    def start_job(self) -> None:
+        source = self.query_one("#source", Input).value.strip()
+        if not source:
+            self.notify("Give me a YouTube URL or a local file path.")
+            return
+
+        try:
+            interval = float(self.query_one("#interval", Input).value)
+            width = int(float(self.query_one("#width", Input).value))
+        except ValueError:
+            self.notify("Interval + Width must be numbers.")
+            return
+
+        mode = self.query_one("#mode", Select).value or "braille"
+        out_name = self.query_one("#out", Input).value.strip() or "ascii_final.mp4"
+
+        # Handle preview mode
+        preview_mode = self.query_one("#preview_mode", Select).value
+        if preview_mode == "auto":
+            self.open_preview_window()
+
+        self.query_one("#start", Button).disabled = True
+        self.query_one("#cancel", Button).disabled = False
+        self.query_one("#log", RichLog).clear()
+        self.query_one("#preview", Static).update("")
+        self.set_stage("Starting…", True)
+        self.set_progress(0)
+
+        self.run_pipeline(source, interval, width, mode, out_name)
+
+    def cancel_job(self) -> None:
+        for worker in list(self.workers):
+            worker.cancel()
+        self.log("⛔ Cancel requested.")
+        self.set_stage("Cancelling…", True)
+
+    def _get_preview_settings(self, interval: float):
+        fps_mode = self.query_one("#preview_fps_mode", Select).value
+        scale_str = self.query_one("#preview_scale", Input).value.strip() or "1.0"
+
+        try:
+            scale = float(scale_str)
+        except ValueError:
+            scale = 1.0
+
+        if fps_mode == "custom":
+            fps_str = self.query_one("#preview_fps", Input).value.strip()
+            try:
+                fps = float(fps_str)
+            except ValueError:
+                fps = 1.0 / max(0.1, interval)
+        else:
+            fps = 1.0 / max(0.1, interval)
+
+        return fps, scale
+
+    def open_preview_window(self) -> None:
+        # Avoid duplicates
+        if self.preview_proc and self.preview_proc.poll() is None:
+            self.notify("Preview already running.")
+            return
+
+        workdir = Path("ascii_work")
+        render_dir = workdir / "render"
+        safe_mkdir(render_dir)
+
+        try:
+            interval = float(self.query_one("#interval", Input).value)
+        except Exception:
+            interval = 5.0
+
+        fps, scale = self._get_preview_settings(interval)
+
+        cmd = [
+            sys.executable,
+            "ascii_preview_window.py",
+            str(render_dir),
+            "--fps",
+            str(fps),
+            "--scale",
+            str(scale),
+            "--title",
+            "ASCII Preview (live)",
+        ]
+
+        # Keep it quiet
+        self.preview_proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self.notify("Preview window opened (q or ESC to close inside the window).")
+
+    def close_preview_window(self) -> None:
+        if self.preview_proc and self.preview_proc.poll() is None:
+            self.preview_proc.terminate()
+            self.preview_proc = None
+            self.notify("Preview window closed.")
+        else:
+            self.notify("No preview window running.")
+
+    @work(thread=True, exclusive=True, exit_on_error=False)
+    def run_pipeline(self, source: str, interval: float, width: int, mode: str, out_name: str) -> None:
+        def post(msg: Message):
+            self.post_message(msg)
+
+        ensure_ffmpeg()
+
+        workdir = Path("ascii_work")
+        frames_dir = workdir / "frames"
+        render_dir = workdir / "render"
+        safe_mkdir(workdir)
+
+        font_path = find_mono_font()
+        font_size = 14
+        padding = 12
+
+        # Clear old
+        if frames_dir.exists():
+            shutil.rmtree(frames_dir)
+        if render_dir.exists():
+            shutil.rmtree(render_dir)
+
+        # 1) Get video
+        if re.match(r"^https?://", source, re.I):
+            post(LogLine("Downloading source…"))
+            video_path = ytdlp_download(source, workdir, post)
+        else:
+            video_path = Path(source).expanduser().resolve()
+            if not video_path.exists():
+                post(LogLine(f"❌ File not found: {video_path}"))
+                return
+            post(LogLine(f"Using local file: {video_path}"))
+
+        # 2) Extract frames
+        extract_frames(video_path, frames_dir, interval, post)
+
+        # 3) Render frames
+        render_frames(
+            frames_dir=frames_dir,
+            render_dir=render_dir,
+            width_chars=width,
+            mode="braille" if mode == "braille" else "ascii",
+            font_path=font_path,
+            font_size=font_size,
+            padding=padding,
+            post=post,
+        )
+
+        # 4) Encode and mux
+        out_silent = workdir / "ascii_silent.mp4"
+        out_final = Path(out_name).expanduser().resolve()
+        assemble_video(render_dir, interval, out_silent, post)
+        mux_audio(out_silent, video_path, out_final, post)
+
+    # ---- UI thread handlers ----
+
+    def on_log_line(self, msg: LogLine) -> None:
+        self.log(msg.text)
+
+    def on_progress_update(self, msg: ProgressUpdate) -> None:
+        stage_map = {
+            "download": ("Downloading…", True),
+            "extract": ("Extracting frames…", True),
+            "render": ("Rendering…", True),
+            "encode": ("Encoding video…", True),
+            "mux": ("Muxing audio…", True),
+        }
+        stage_text, spinning = stage_map.get(msg.stage, (msg.stage, True))
+        self.set_stage(stage_text, spinning)
+        self.set_progress(msg.percent)
+
+        if msg.stage == "mux" and msg.percent == 100.0:
+            self.set_stage("Done ✅", False)
+            self.query_one("#start", Button).disabled = False
+            self.query_one("#cancel", Button).disabled = True
+
+            # Auto-close preview if enabled
+            autoclose = self.query_one("#preview_autoclose", Switch).value
+            if autoclose:
+                self.close_preview_window()
+
+    def on_preview_frame(self, msg: PreviewFrame) -> None:
+        self.query_one("#preview", Static).update(
+            f"[Frame {msg.frame}/{msg.total}]\n\n{msg.text}"
+        )
+
+    def on_worker_state_changed(self, event) -> None:
+        if getattr(event, "worker", None) and event.worker.is_finished:
+            self.query_one("#start", Button).disabled = False
+            self.query_one("#cancel", Button).disabled = True
+            self.set_stage("Idle", False)
+
+
+if __name__ == "__main__":
+    AsciiMV().run()
+```
+
+---
+
+## Run it
+
+In the folder with both scripts:
+
+```bash
+python ascii_mv_tui.py
+```
+
+---
+
+## Suggested presets (so you can “dial the vibe” fast 🎚️)
+
+* **Storyboard mode**: interval `5.0`, width `200`, braille, preview fps auto (0.2)
+* **Smooth-ish**: interval `0.2`, width `220`, braille, preview fps auto (5)
+* **Music video**: interval `0.1`, width `240-320`, braille, preview fps auto (10)
+
+If you want, I can add a “Preset” dropdown inside the TUI that auto-fills these values (one click: *Storyboard / Smooth / Music Video*) 😄
