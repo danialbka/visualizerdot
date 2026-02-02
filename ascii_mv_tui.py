@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import json
 import math
 import os
 import re
@@ -18,8 +19,11 @@ from textual import work
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
+from textual.screen import ModalScreen
 from textual.widgets import (
     Button,
+    Checkbox,
+    DirectoryTree,
     Footer,
     Header,
     Input,
@@ -34,7 +38,21 @@ from textual.worker import get_current_worker
 
 
 ASCII_RAMP = " .'`^\",:;Il!i><~+_-?][}{1)(|\\/*tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&8%B@$"
-Mode = Literal["ascii", "braille"]
+Mode = Literal["ascii", "braille", "ascii_color", "braille_color"]
+VIDEO_EXTS = {
+    ".mp4",
+    ".mov",
+    ".mkv",
+    ".avi",
+    ".webm",
+    ".m4v",
+    ".wmv",
+    ".flv",
+    ".mpeg",
+    ".mpg",
+}
+SETTINGS_PATH = Path("ascii_work") / "settings.json"
+DEFAULT_COLOR_INTENSITY = 100
 
 
 class PipelineCancelled(RuntimeError):
@@ -124,6 +142,33 @@ def detect_js_runtimes() -> dict[str, dict]:
     return runtimes
 
 
+def is_video_path(path: Path) -> bool:
+    return path.suffix.lower() in VIDEO_EXTS
+
+
+def ensure_mp4_suffix(path_str: str) -> str:
+    raw = path_str.strip().strip('"')
+    if not raw:
+        return "ascii_final.mp4"
+    if raw.lower().endswith(".mp4"):
+        return raw
+    return f"{raw}.mp4"
+
+
+def load_settings() -> dict:
+    if not SETTINGS_PATH.exists():
+        return {}
+    try:
+        return json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_settings(data: dict) -> None:
+    safe_mkdir(SETTINGS_PATH.parent)
+    SETTINGS_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
 def font_supports_distinct_braille(font_path: str) -> bool:
     """Detect 'tofu' (all braille chars rendered identically as missing-glyph boxes)."""
     try:
@@ -168,7 +213,7 @@ def find_braille_font() -> str:
 
 
 def find_font_for_mode(mode: Mode) -> str:
-    return find_braille_font() if mode == "braille" else find_mono_font()
+    return find_braille_font() if "braille" in mode else find_mono_font()
 
 
 def run_process_checked(cmd: list[str], *, log_prefix: str = "") -> None:
@@ -311,6 +356,29 @@ def img_to_ascii(img_path: Path, width_chars: int) -> str:
     return "\n".join(lines)
 
 
+def img_to_ascii_color(img_path: Path, width_chars: int) -> tuple[list[str], list[list[tuple[int, int, int]]]]:
+    img_rgb = Image.open(img_path).convert("RGB")
+    img_l = prepare_luma(img_rgb.convert("L"))
+    w, h = img_rgb.size
+
+    aspect_fix = 0.55
+    height_chars = max(1, int((h / w) * width_chars * aspect_fix))
+
+    small_l = img_l.resize((width_chars, height_chars), Image.Resampling.LANCZOS)
+    small_rgb = img_rgb.resize((width_chars, height_chars), Image.Resampling.LANCZOS)
+
+    arr_l = np.asarray(small_l, dtype=np.uint8)
+    arr_rgb = np.asarray(small_rgb, dtype=np.uint8)
+
+    idx = (arr_l.astype(np.float32) / 255.0) * (len(ASCII_RAMP) - 1)
+    idx = idx.astype(np.int32)
+    idx = (len(ASCII_RAMP) - 1) - idx
+
+    lines = ["".join(ASCII_RAMP[i] for i in row) for row in idx]
+    colors = [[tuple(arr_rgb[y, x]) for x in range(width_chars)] for y in range(height_chars)]
+    return lines, colors
+
+
 def img_to_braille(img_path: Path, width_chars: int, threshold: int = 140) -> str:
     img = Image.open(img_path).convert("L")
     img = prepare_luma(img)
@@ -357,6 +425,52 @@ def img_to_braille(img_path: Path, width_chars: int, threshold: int = 140) -> st
     return "\n".join(lines)
 
 
+def img_to_braille_color(
+    img_path: Path, width_chars: int, threshold: int = 140
+) -> tuple[list[str], list[list[tuple[int, int, int]]]]:
+    img_rgb = Image.open(img_path).convert("RGB")
+    img_l = prepare_luma(img_rgb.convert("L"))
+    w, h = img_rgb.size
+
+    height_chars = max(1, int((h / w) * width_chars / 2))
+
+    target_w = width_chars * 2
+    target_h = height_chars * 4
+    small_l = img_l.resize((target_w, target_h), Image.Resampling.LANCZOS)
+    arr = np.asarray(small_l, dtype=np.uint8)
+    on = floyd_steinberg_dither(arr, threshold=threshold)
+
+    small_rgb = img_rgb.resize((width_chars, height_chars), Image.Resampling.LANCZOS)
+    arr_rgb = np.asarray(small_rgb, dtype=np.uint8)
+
+    dot_bits = [
+        (0, 0, 0x01),
+        (0, 1, 0x02),
+        (0, 2, 0x04),
+        (1, 0, 0x08),
+        (1, 1, 0x10),
+        (1, 2, 0x20),
+        (0, 3, 0x40),
+        (1, 3, 0x80),
+    ]
+
+    lines: list[str] = []
+    for cy in range(height_chars):
+        y0 = cy * 4
+        row_chars: list[str] = []
+        for cx in range(width_chars):
+            x0 = cx * 2
+            bits = 0
+            for dx, dy, b in dot_bits:
+                if on[y0 + dy, x0 + dx]:
+                    bits |= b
+            row_chars.append(chr(0x2800 + bits))
+        lines.append("".join(row_chars))
+
+    colors = [[tuple(arr_rgb[y, x]) for x in range(width_chars)] for y in range(height_chars)]
+    return lines, colors
+
+
 def render_text_to_png(
     text: str,
     out_path: Path,
@@ -397,6 +511,64 @@ def render_text_to_png(
     y = padding
     for line in lines:
         draw.text((padding, y), line, font=font, fill=(255, 255, 255))
+        y += line_h
+    canvas.save(out_path)
+
+
+def render_text_to_png_color(
+    lines: list[str],
+    colors: list[list[tuple[int, int, int]]],
+    out_path: Path,
+    font_path: str,
+    font_size: int,
+    padding: int,
+    color_intensity: float,
+    auto_dim: bool,
+) -> None:
+    font = ImageFont.truetype(font_path, font_size)
+    lines = lines or [""]
+
+    ascent, descent = font.getmetrics()
+    line_h = max(1, ascent + descent)
+
+    sample_chars = ["\u28ff", "M"]
+    char_w = 0
+    char_h = 0
+    for ch in sample_chars:
+        try:
+            bbox = font.getbbox(ch)
+            char_w = max(char_w, bbox[2] - bbox[0])
+            char_h = max(char_h, bbox[3] - bbox[1])
+        except Exception:
+            continue
+    char_w = max(1, int(char_w))
+    char_h = max(1, int(max(char_h, line_h)))
+
+    img_w = padding * 2 + char_w * max(len(line) for line in lines)
+    img_h = padding * 2 + line_h * len(lines)
+
+    canvas = Image.new("RGB", (img_w, img_h), (0, 0, 0))
+    draw = ImageDraw.Draw(canvas)
+    y = padding
+    for row_idx, line in enumerate(lines):
+        x = padding
+        row_colors = colors[row_idx] if row_idx < len(colors) else []
+        for col_idx, ch in enumerate(line):
+            color = (255, 255, 255)
+            if col_idx < len(row_colors):
+                color = row_colors[col_idx]
+                luma = int(0.2126 * color[0] + 0.7152 * color[1] + 0.0722 * color[2])
+                if auto_dim and luma > 200:
+                    color = (int(color[0] * 0.7), int(color[1] * 0.7), int(color[2] * 0.7))
+                if color_intensity < 1.0:
+                    gray = (luma, luma, luma)
+                    color = (
+                        int(gray[0] + (color[0] - gray[0]) * color_intensity),
+                        int(gray[1] + (color[1] - gray[1]) * color_intensity),
+                        int(gray[2] + (color[2] - gray[2]) * color_intensity),
+                    )
+            draw.text((x, y), ch, font=font, fill=color)
+            x += char_w
         y += line_h
     canvas.save(out_path)
 
@@ -557,6 +729,8 @@ def render_frames(
     font_path: str,
     font_size: int,
     padding: int,
+    color_intensity: float,
+    auto_dim: bool,
     post,
 ) -> None:
     safe_mkdir(render_dir)
@@ -573,13 +747,32 @@ def render_frames(
         if worker is not None and worker.is_cancelled:
             raise PipelineCancelled("Cancelled.")
 
-        if mode == "braille":
+        color = mode in {"ascii_color", "braille_color"}
+        if color:
+            if "braille" in mode:
+                lines, colors = img_to_braille_color(img_path, width_chars, threshold=braille_threshold)
+            else:
+                lines, colors = img_to_ascii_color(img_path, width_chars)
+            text = "\n".join(lines)
+        elif mode == "braille":
             text = img_to_braille(img_path, width_chars, threshold=braille_threshold)
         else:
             text = img_to_ascii(img_path, width_chars)
 
         out_png = render_dir / img_path.name
-        render_text_to_png(text, out_png, font_path, font_size, padding)
+        if color:
+            render_text_to_png_color(
+                lines,
+                colors,
+                out_png,
+                font_path,
+                font_size,
+                padding,
+                color_intensity,
+                auto_dim,
+            )
+        else:
+            render_text_to_png(text, out_png, font_path, font_size, padding)
 
         if i == 1 or i % 5 == 0 or i == total:
             post(PreviewFrame(frame=i, total=total, text=text))
@@ -724,10 +917,97 @@ class PreviewFrame(Message):
 # -------------------------
 
 
+class FilePickerScreen(ModalScreen[Optional[Path]]):
+    DEFAULT_CSS = """
+    FilePickerScreen {
+        align: center middle;
+    }
+    #picker {
+        width: 80%;
+        height: 80%;
+        border: round $panel;
+        padding: 1;
+        background: $surface;
+    }
+    #picker_tree {
+        height: 1fr;
+    }
+    #picker_path {
+        width: 1fr;
+    }
+    #picker_actions {
+        height: auto;
+    }
+    """
+
+    def __init__(self, start_dir: Path, videos_dir: Optional[Path]) -> None:
+        super().__init__()
+        self._start_dir = start_dir
+        self._videos_dir = videos_dir
+        self._selected: Optional[Path] = None
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="picker"):
+            yield Label("Choose a local video file")
+            with Horizontal():
+                yield Label("Location:")
+                options = [("Current folder", "current")]
+                if self._videos_dir is not None:
+                    options.append(("videosnongenerated", "videos"))
+                yield Select(options=options, value="current", id="picker_location")
+            yield Input(value=str(self._start_dir), id="picker_path")
+            yield DirectoryTree(str(self._start_dir), id="picker_tree")
+            with Horizontal(id="picker_actions"):
+                yield Button("Use Selected", id="picker_use", variant="success")
+                yield Button("Cancel", id="picker_cancel", variant="error")
+
+    def on_directory_tree_file_selected(self, msg: DirectoryTree.FileSelected) -> None:
+        self._selected = msg.path
+        self.query_one("#picker_path", Input).value = str(msg.path)
+
+    def on_select_changed(self, msg: Select.Changed) -> None:
+        if msg.select.id != "picker_location":
+            return
+        if msg.value == "videos" and self._videos_dir is not None:
+            self._set_tree_root(self._videos_dir)
+        else:
+            self._set_tree_root(self._start_dir)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "picker_path":
+            self._use_path(event.input.value)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        bid = event.button.id
+        if bid == "picker_cancel":
+            self.dismiss(None)
+        elif bid == "picker_use":
+            self._use_path(self.query_one("#picker_path", Input).value)
+
+    def _use_path(self, raw: str) -> None:
+        candidate = Path(raw.strip().strip('"')).expanduser()
+        if candidate.is_dir():
+            self.notify("Select a file, not a folder.")
+            return
+        if not candidate.exists():
+            self.notify("File not found.")
+            return
+        if not is_video_path(candidate):
+            self.notify("That file doesn't look like a video.")
+            return
+        self.dismiss(candidate.resolve())
+
+    def _set_tree_root(self, path: Path) -> None:
+        tree = self.query_one("#picker_tree", DirectoryTree)
+        tree.path = path
+        self.query_one("#picker_path", Input).value = str(path)
+
+
 class AsciiMV(App):
     CSS = """
     Screen { layout: vertical; }
     #top { height: auto; padding: 1; }
+    #row_source { height: auto; }
     #row_a { height: auto; margin-top: 1; }
     #row_b { height: auto; margin-top: 1; }
     #row_c { height: auto; margin-top: 1; }
@@ -742,6 +1022,10 @@ class AsciiMV(App):
     #mode { width: 26; }
     #out { width: 1fr; }
     #encoder { width: 22; }
+    #browse { width: 12; }
+    #reset { width: 12; }
+    #settings_path { height: auto; color: $text-muted; }
+    #color_intensity { width: 10; }
     """
 
     TITLE = "ASCII Music Video (TUI)"
@@ -749,6 +1033,8 @@ class AsciiMV(App):
 
     BINDINGS = [
         ("ctrl+s", "start", "Start"),
+        ("ctrl+o", "browse", "Browse"),
+        ("ctrl+r", "reset", "Reset"),
         ("ctrl+c", "cancel", "Cancel"),
         ("ctrl+q", "quit", "Quit"),
     ]
@@ -762,7 +1048,9 @@ class AsciiMV(App):
 
         with Vertical(id="top"):
             yield Label("Source (YouTube URL or local file path):")
-            yield Input(placeholder="https://www.youtube.com/watch?v=... OR C:\\video.mp4", id="source")
+            with Horizontal(id="row_source"):
+                yield Input(placeholder="https://www.youtube.com/watch?v=... OR C:\\video.mp4", id="source")
+                yield Button("Browse", id="browse")
 
             # Keep the primary action visible even on narrow terminals by splitting rows.
             with Horizontal(id="row_a"):
@@ -772,12 +1060,22 @@ class AsciiMV(App):
                 yield Input(value="200", id="width", type="number")
                 yield Label("Mode:")
                 yield Select(
-                    options=[("ASCII ramp", "ascii"), ("Braille (ultra-dense)", "braille")],
+                    options=[
+                        ("ASCII ramp", "ascii"),
+                        ("ASCII ramp (color)", "ascii_color"),
+                        ("Braille (ultra-dense)", "braille"),
+                        ("Braille (color)", "braille_color"),
+                    ],
                     value="braille",
                     id="mode",
                 )
                 yield Label("Braille Thresh:")
                 yield Input(value="140", id="braille_thresh", type="number")
+
+            with Horizontal(id="row_c"):
+                yield Label("Color Intensity:")
+                yield Input(value=str(DEFAULT_COLOR_INTENSITY), id="color_intensity", type="number")
+                yield Checkbox("Auto-dim", True, id="auto_dim")
 
             with Horizontal(id="row_b"):
                 yield Label("Output:")
@@ -788,6 +1086,7 @@ class AsciiMV(App):
                     value="auto",
                     id="encoder",
                 )
+                yield Button("Reset", id="reset", variant="warning")
                 yield Button("Start", id="start", variant="success")
                 yield Button("Cancel", id="cancel", variant="error", disabled=True)
 
@@ -798,6 +1097,7 @@ class AsciiMV(App):
                 with Horizontal(id="status_row"):
                     yield LoadingIndicator(id="spinner")
                     yield Label("Idle", id="stage")
+                yield Label("", id="settings_path")
                 yield ProgressBar(total=100, id="progress")
 
             with Vertical(id="right"):
@@ -809,9 +1109,76 @@ class AsciiMV(App):
 
     def on_mount(self) -> None:
         self.query_one("#spinner", LoadingIndicator).display = False
+        self.query_one("#settings_path", Label).update(f"Settings: {SETTINGS_PATH.resolve()}")
+        self._load_settings_into_ui()
+
+    def action_quit(self) -> None:
+        self._save_settings_from_ui()
+        self.exit()
+
+    def on_unmount(self) -> None:
+        self._save_settings_from_ui()
 
     def append_log(self, text: str) -> None:
         self.query_one("#log", RichLog).write(text)
+
+    def _apply_defaults(self) -> None:
+        self.query_one("#source", Input).value = ""
+        self.query_one("#fps", Input).value = "5"
+        self.query_one("#width", Input).value = "200"
+        self.query_one("#braille_thresh", Input).value = "140"
+        self.query_one("#mode", Select).value = "braille"
+        self.query_one("#out", Input).value = "ascii_final.mp4"
+        self.query_one("#encoder", Select).value = "auto"
+        self.query_one("#color_intensity", Input).value = str(DEFAULT_COLOR_INTENSITY)
+        self.query_one("#auto_dim", Checkbox).value = True
+
+    def reset_settings(self) -> None:
+        self._apply_defaults()
+        self._save_settings_from_ui()
+        self.notify("Settings reset to defaults.")
+
+    def _collect_settings(self) -> dict:
+        return {
+            "source": self.query_one("#source", Input).value.strip(),
+            "fps": self.query_one("#fps", Input).value.strip(),
+            "width": self.query_one("#width", Input).value.strip(),
+            "braille_thresh": self.query_one("#braille_thresh", Input).value.strip(),
+            "mode": self.query_one("#mode", Select).value or "braille",
+            "out": self.query_one("#out", Input).value.strip(),
+            "encoder": self.query_one("#encoder", Select).value or "auto",
+            "color_intensity": self.query_one("#color_intensity", Input).value.strip(),
+            "auto_dim": bool(self.query_one("#auto_dim", Checkbox).value),
+        }
+
+    def _save_settings_from_ui(self) -> None:
+        try:
+            save_settings(self._collect_settings())
+        except Exception:
+            pass
+
+    def _load_settings_into_ui(self) -> None:
+        data = load_settings()
+        if not data:
+            return
+        if "source" in data:
+            self.query_one("#source", Input).value = str(data["source"])
+        if "fps" in data:
+            self.query_one("#fps", Input).value = str(data["fps"])
+        if "width" in data:
+            self.query_one("#width", Input).value = str(data["width"])
+        if "braille_thresh" in data:
+            self.query_one("#braille_thresh", Input).value = str(data["braille_thresh"])
+        if "mode" in data:
+            self.query_one("#mode", Select).value = str(data["mode"])
+        if "out" in data:
+            self.query_one("#out", Input).value = ensure_mp4_suffix(str(data["out"]))
+        if "encoder" in data:
+            self.query_one("#encoder", Select).value = str(data["encoder"])
+        if "color_intensity" in data:
+            self.query_one("#color_intensity", Input).value = str(data["color_intensity"])
+        if "auto_dim" in data:
+            self.query_one("#auto_dim", Checkbox).value = bool(data["auto_dim"])
 
     def set_stage(self, stage: str, spinning: bool) -> None:
         self._stage_text = stage
@@ -832,6 +1199,10 @@ class AsciiMV(App):
             self.start_job()
         elif bid == "cancel":
             self.cancel_job()
+        elif bid == "browse":
+            self.open_file_picker()
+        elif bid == "reset":
+            self.reset_settings()
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         # Users expect Enter to "go". Start when submitting the main fields.
@@ -841,11 +1212,33 @@ class AsciiMV(App):
     def action_start(self) -> None:
         self.start_job()
 
+    def action_browse(self) -> None:
+        self.open_file_picker()
+
+    def action_reset(self) -> None:
+        self.reset_settings()
+
     def action_cancel(self) -> None:
         self.cancel_job()
 
+    def open_file_picker(self) -> None:
+        raw = self.query_one("#source", Input).value.strip().strip('"')
+        start_dir = Path.cwd()
+        if raw:
+            candidate = Path(raw).expanduser()
+            if candidate.exists():
+                start_dir = candidate if candidate.is_dir() else candidate.parent
+        videos_dir = (Path.cwd() / "videosnongenerated")
+        if not videos_dir.exists():
+            videos_dir = None
+        self.push_screen(FilePickerScreen(start_dir, videos_dir), callback=self._on_file_picked)
+
+    def _on_file_picked(self, result: Optional[Path]) -> None:
+        if result is not None:
+            self.query_one("#source", Input).value = str(result)
+
     def start_job(self) -> None:
-        source = self.query_one("#source", Input).value.strip()
+        source = self.query_one("#source", Input).value.strip().strip('"')
         if not source:
             self.notify("Enter a YouTube URL or a local file path.")
             return
@@ -854,8 +1247,9 @@ class AsciiMV(App):
             fps = float(self.query_one("#fps", Input).value)
             width = int(float(self.query_one("#width", Input).value))
             braille_thresh = int(float(self.query_one("#braille_thresh", Input).value))
+            color_intensity_raw = float(self.query_one("#color_intensity", Input).value)
         except ValueError:
-            self.notify("FPS, Width, and Braille Thresh must be numbers.")
+            self.notify("FPS, Width, Braille Thresh, and Color Intensity must be numbers.")
             return
 
         if fps <= 0:
@@ -867,10 +1261,15 @@ class AsciiMV(App):
         if braille_thresh < 0 or braille_thresh > 255:
             self.notify("Braille Thresh must be between 0 and 255.")
             return
+        if color_intensity_raw < 0 or color_intensity_raw > 100:
+            self.notify("Color Intensity must be between 0 and 100.")
+            return
 
         mode = self.query_one("#mode", Select).value or "braille"
-        out_name = self.query_one("#out", Input).value.strip() or "ascii_final.mp4"
+        out_name = ensure_mp4_suffix(self.query_one("#out", Input).value)
         encoder = self.query_one("#encoder", Select).value or "auto"
+        color_intensity = max(0.0, min(1.0, color_intensity_raw / 100.0))
+        auto_dim = bool(self.query_one("#auto_dim", Checkbox).value)
 
         self.query_one("#start", Button).disabled = True
         self.query_one("#cancel", Button).disabled = False
@@ -879,7 +1278,18 @@ class AsciiMV(App):
         self.set_stage("Starting...", True)
         self.set_progress(0)
 
-        self.run_pipeline(source, fps, width, braille_thresh, mode, out_name, encoder)
+        self._save_settings_from_ui()
+        self.run_pipeline(
+            source,
+            fps,
+            width,
+            braille_thresh,
+            mode,
+            out_name,
+            encoder,
+            color_intensity,
+            auto_dim,
+        )
 
     def cancel_job(self) -> None:
         for worker in list(self.workers):
@@ -898,6 +1308,8 @@ class AsciiMV(App):
         mode: str,
         out_name: str,
         encoder: str,
+        color_intensity: float,
+        auto_dim: bool,
     ) -> None:
         def post(msg: Message) -> None:
             self.post_message(msg)
@@ -910,7 +1322,7 @@ class AsciiMV(App):
             render_dir = workdir / "render"
             safe_mkdir(workdir)
 
-            font_path = find_font_for_mode("braille" if mode == "braille" else "ascii")
+            font_path = find_font_for_mode("braille" if "braille" in mode else "ascii")
             font_size = 14
             padding = 12
 
@@ -940,16 +1352,18 @@ class AsciiMV(App):
                 render_dir=render_dir,
                 width_chars=width,
                 braille_threshold=braille_thresh,
-                mode="braille" if mode == "braille" else "ascii",
+                mode=mode,
                 font_path=font_path,
                 font_size=font_size,
                 padding=padding,
+                color_intensity=color_intensity,
+                auto_dim=auto_dim,
                 post=post,
             )
 
             # 4) Encode and mux
             out_silent = workdir / "ascii_silent.mp4"
-            out_final = Path(out_name).expanduser().resolve()
+            out_final = Path(ensure_mp4_suffix(out_name)).expanduser().resolve()
             assemble_video(render_dir, fps, out_silent, post, encoder=encoder)
             mux_audio(out_silent, video_path, out_final, post)
 
@@ -1011,7 +1425,12 @@ if __name__ == "__main__":
         help="Seconds per frame (legacy). If provided, FPS will be computed as 1/interval.",
     )
     ap.add_argument("--width", type=int, default=200, help="Output width in characters.")
-    ap.add_argument("--mode", choices=["ascii", "braille"], default="braille", help="Text mode.")
+    ap.add_argument(
+        "--mode",
+        choices=["ascii", "braille", "ascii_color", "braille_color"],
+        default="braille",
+        help="Text mode (use *_color for colored render).",
+    )
     ap.add_argument(
         "--encoder",
         choices=["auto", "libx264", "h264_nvenc"],
@@ -1023,6 +1442,17 @@ if __name__ == "__main__":
         type=int,
         default=140,
         help="Braille threshold 0-255 (lower = darker, higher = lighter).",
+    )
+    ap.add_argument(
+        "--color-intensity",
+        type=float,
+        default=float(DEFAULT_COLOR_INTENSITY),
+        help="Color intensity 0-100 (0 = grayscale, 100 = full color).",
+    )
+    ap.add_argument(
+        "--auto-dim",
+        action="store_true",
+        help="Auto-dim very bright colors for readability (color modes only).",
     )
     ap.add_argument("--out", type=str, default="ascii_final.mp4", help="Output mp4 path.")
     args = ap.parse_args()
@@ -1052,12 +1482,13 @@ if __name__ == "__main__":
         if render_dir.exists():
             rmtree_retry(render_dir)
 
-        font_path = find_font_for_mode("braille" if args.mode == "braille" else "ascii")
+        font_path = find_font_for_mode("braille" if "braille" in args.mode else "ascii")
         font_size = 14
         padding = 12
 
         fps = float(args.fps)
         braille_thresh = int(args.braille_threshold)
+        color_intensity_raw = float(args.color_intensity)
         if args.interval is not None:
             if args.interval <= 0:
                 raise SystemExit("--interval must be > 0")
@@ -1066,6 +1497,9 @@ if __name__ == "__main__":
             raise SystemExit("--fps must be > 0")
         if braille_thresh < 0 or braille_thresh > 255:
             raise SystemExit("--braille-threshold must be between 0 and 255")
+        if color_intensity_raw < 0 or color_intensity_raw > 100:
+            raise SystemExit("--color-intensity must be between 0 and 100")
+        color_intensity = max(0.0, min(1.0, color_intensity_raw / 100.0))
 
         source = args.source.strip()
         if re.match(r"^https?://", source, re.I):
@@ -1083,14 +1517,16 @@ if __name__ == "__main__":
             render_dir=render_dir,
             width_chars=int(args.width),
             braille_threshold=braille_thresh,
-            mode="braille" if args.mode == "braille" else "ascii",
+            mode=args.mode,
             font_path=font_path,
             font_size=font_size,
             padding=padding,
+            color_intensity=color_intensity,
+            auto_dim=bool(args.auto_dim),
             post=post,
         )
         out_silent = workdir / "ascii_silent.mp4"
-        out_final = Path(args.out).expanduser().resolve()
+        out_final = Path(ensure_mp4_suffix(args.out)).expanduser().resolve()
         assemble_video(render_dir, fps, out_silent, post, encoder=args.encoder)
         mux_audio(out_silent, video_path, out_final, post)
     else:
